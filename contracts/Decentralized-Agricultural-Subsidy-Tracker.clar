@@ -169,3 +169,291 @@
     (ok true)
   )
 )
+(define-data-var next-application-id uint u1)
+
+(define-map subsidy-applications
+  { application-id: uint }
+  {
+    farmer-id: uint,
+    subsidy-id: uint,
+    application-date: uint,
+    status: (string-ascii 20),
+    justification: (string-ascii 500),
+    admin-notes: (string-ascii 500),
+    review-date: (optional uint)
+  }
+)
+
+(define-map farmer-application-history
+  { farmer-id: uint }
+  {
+    total-applications: uint,
+    approved-applications: uint,
+    rejected-applications: uint,
+    pending-applications: uint
+  }
+)
+
+(define-public (apply-for-subsidy (farmer-id uint) (subsidy-id uint) (justification (string-ascii 500)))
+  (let (
+    (farmer-info (map-get? farmers { farmer-id: farmer-id }))
+    (subsidy-info (map-get? subsidies { subsidy-id: subsidy-id }))
+    (application-id (var-get next-application-id))
+    (farmer-history (default-to { total-applications: u0, approved-applications: u0, rejected-applications: u0, pending-applications: u0 }
+                                (map-get? farmer-application-history { farmer-id: farmer-id })))
+  )
+    (asserts! (is-some farmer-info) (err u404))
+    (asserts! (is-some subsidy-info) (err u404))
+    (asserts! (is-eq tx-sender (get principal (unwrap-panic farmer-info))) (err u403))
+    (asserts! (get verified (unwrap-panic farmer-info)) (err u400))
+    (asserts! (get active (unwrap-panic subsidy-info)) (err u400))
+    (asserts! (<= stacks-block-height (get end-date (unwrap-panic subsidy-info))) (err u400))
+    (asserts! (is-none (map-get? farmer-subsidies { farmer-id: farmer-id, subsidy-id: subsidy-id })) (err u400))
+    (map-set subsidy-applications
+      { application-id: application-id }
+      {
+        farmer-id: farmer-id,
+        subsidy-id: subsidy-id,
+        application-date: stacks-block-height,
+        status: "pending",
+        justification: justification,
+        admin-notes: "",
+        review-date: none
+      }
+    )
+    (map-set farmer-application-history
+      { farmer-id: farmer-id }
+      {
+        total-applications: (+ (get total-applications farmer-history) u1),
+        approved-applications: (get approved-applications farmer-history),
+        rejected-applications: (get rejected-applications farmer-history),
+        pending-applications: (+ (get pending-applications farmer-history) u1)
+      }
+    )
+    (var-set next-application-id (+ application-id u1))
+    (ok application-id)
+  )
+)
+
+(define-public (review-application (application-id uint) (approve bool) (admin-notes (string-ascii 500)))
+  (let (
+    (application-info (map-get? subsidy-applications { application-id: application-id }))
+    (farmer-history (unwrap-panic (map-get? farmer-application-history { farmer-id: (get farmer-id (unwrap-panic application-info)) })))
+  )
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-some application-info) (err u404))
+    (asserts! (is-eq (get status (unwrap-panic application-info)) "pending") (err u400))
+    (if approve
+      (begin
+        (try! (distribute-subsidy (get farmer-id (unwrap-panic application-info)) (get subsidy-id (unwrap-panic application-info))))
+        (map-set subsidy-applications
+          { application-id: application-id }
+          (merge (unwrap-panic application-info) { status: "approved", admin-notes: admin-notes, review-date: (some stacks-block-height) })
+        )
+        (map-set farmer-application-history
+          { farmer-id: (get farmer-id (unwrap-panic application-info)) }
+          {
+            total-applications: (get total-applications farmer-history),
+            approved-applications: (+ (get approved-applications farmer-history) u1),
+            rejected-applications: (get rejected-applications farmer-history),
+            pending-applications: (- (get pending-applications farmer-history) u1)
+          }
+        )
+      )
+      (begin
+        (map-set subsidy-applications
+          { application-id: application-id }
+          (merge (unwrap-panic application-info) { status: "rejected", admin-notes: admin-notes, review-date: (some stacks-block-height) })
+        )
+        (map-set farmer-application-history
+          { farmer-id: (get farmer-id (unwrap-panic application-info)) }
+          {
+            total-applications: (get total-applications farmer-history),
+            approved-applications: (get approved-applications farmer-history),
+            rejected-applications: (+ (get rejected-applications farmer-history) u1),
+            pending-applications: (- (get pending-applications farmer-history) u1)
+          }
+        )
+      )
+    )
+    (ok approve)
+  )
+)
+
+(define-read-only (get-application (application-id uint))
+  (map-get? subsidy-applications { application-id: application-id })
+)
+
+(define-read-only (get-farmer-application-history (farmer-id uint))
+  (map-get? farmer-application-history { farmer-id: farmer-id })
+)
+(define-data-var required-signatures uint u2)
+(define-data-var next-proposal-id uint u1)
+(define-data-var signature-threshold uint u1000000)
+
+(define-map authorized-signers
+  { signer: principal }
+  {
+    active: bool,
+    added-at: uint
+  }
+)
+
+(define-map proposals
+  { proposal-id: uint }
+  {
+    proposal-type: (string-ascii 50),
+    target-farmer-id: uint,
+    target-subsidy-id: uint,
+    amount: uint,
+    created-by: principal,
+    created-at: uint,
+    executed: bool,
+    signatures-count: uint,
+    description: (string-ascii 255)
+  }
+)
+
+(define-map proposal-signatures
+  { proposal-id: uint, signer: principal }
+  {
+    signed: bool,
+    signed-at: uint
+  }
+)
+
+(define-public (add-authorized-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-none (map-get? authorized-signers { signer: signer })) (err u400))
+    (map-set authorized-signers
+      { signer: signer }
+      {
+        active: true,
+        added-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-authorized-signer (signer principal))
+  (let ((signer-info (map-get? authorized-signers { signer: signer })))
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-some signer-info) (err u404))
+    (map-set authorized-signers
+      { signer: signer }
+      (merge (unwrap-panic signer-info) { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-subsidy-proposal (farmer-id uint) (subsidy-id uint) (description (string-ascii 255)))
+  (let (
+    (proposal-id (var-get next-proposal-id))
+    (subsidy-info (map-get? subsidies { subsidy-id: subsidy-id }))
+    (signer-info (map-get? authorized-signers { signer: tx-sender }))
+  )
+    (asserts! (is-some signer-info) (err u403))
+    (asserts! (get active (unwrap-panic signer-info)) (err u403))
+    (asserts! (is-some subsidy-info) (err u404))
+    (asserts! (>= (get amount (unwrap-panic subsidy-info)) (var-get signature-threshold)) (err u400))
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        proposal-type: "subsidy-distribution",
+        target-farmer-id: farmer-id,
+        target-subsidy-id: subsidy-id,
+        amount: (get amount (unwrap-panic subsidy-info)),
+        created-by: tx-sender,
+        created-at: stacks-block-height,
+        executed: false,
+        signatures-count: u0,
+        description: description
+      }
+    )
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)
+  )
+)
+
+(define-public (sign-proposal (proposal-id uint))
+  (let (
+    (proposal-info (map-get? proposals { proposal-id: proposal-id }))
+    (signer-info (map-get? authorized-signers { signer: tx-sender }))
+    (existing-signature (map-get? proposal-signatures { proposal-id: proposal-id, signer: tx-sender }))
+  )
+    (asserts! (is-some signer-info) (err u403))
+    (asserts! (get active (unwrap-panic signer-info)) (err u403))
+    (asserts! (is-some proposal-info) (err u404))
+    (asserts! (not (get executed (unwrap-panic proposal-info))) (err u400))
+    (asserts! (is-none existing-signature) (err u400))
+    (map-set proposal-signatures
+      { proposal-id: proposal-id, signer: tx-sender }
+      {
+        signed: true,
+        signed-at: stacks-block-height
+      }
+    )
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge (unwrap-panic proposal-info) { signatures-count: (+ (get signatures-count (unwrap-panic proposal-info)) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let (
+    (proposal-info (map-get? proposals { proposal-id: proposal-id }))
+    (signer-info (map-get? authorized-signers { signer: tx-sender }))
+  )
+    (asserts! (is-some signer-info) (err u403))
+    (asserts! (get active (unwrap-panic signer-info)) (err u403))
+    (asserts! (is-some proposal-info) (err u404))
+    (asserts! (not (get executed (unwrap-panic proposal-info))) (err u400))
+    (asserts! (>= (get signatures-count (unwrap-panic proposal-info)) (var-get required-signatures)) (err u400))
+    (try! (if (is-eq (get proposal-type (unwrap-panic proposal-info)) "subsidy-distribution")
+      (distribute-subsidy (get target-farmer-id (unwrap-panic proposal-info)) (get target-subsidy-id (unwrap-panic proposal-info)))
+      (err u400)
+    ))
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge (unwrap-panic proposal-info) { executed: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-required-signatures (new-requirement uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (> new-requirement u0) (err u400))
+    (var-set required-signatures new-requirement)
+    (ok true)
+  )
+)
+
+(define-public (set-signature-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (var-set signature-threshold new-threshold)
+    (ok true)
+  )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-proposal-signature (proposal-id uint) (signer principal))
+  (map-get? proposal-signatures { proposal-id: proposal-id, signer: signer })
+)
+
+(define-read-only (is-authorized-signer (signer principal))
+  (match (map-get? authorized-signers { signer: signer })
+    signer-info (get active signer-info)
+    false
+  )
+)
