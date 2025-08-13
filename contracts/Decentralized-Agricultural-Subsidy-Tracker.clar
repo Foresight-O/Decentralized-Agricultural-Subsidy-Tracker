@@ -457,3 +457,151 @@
     false
   )
 )
+
+(define-data-var next-fraud-report-id uint u1)
+
+(define-map fraud-reports
+  { report-id: uint }
+  {
+    reporter: principal,
+    target-farmer-id: uint,
+    target-subsidy-id: uint,
+    report-type: (string-ascii 50),
+    description: (string-ascii 500),
+    evidence-hash: (string-ascii 64),
+    status: (string-ascii 20),
+    reported-at: uint,
+    reviewed-at: (optional uint),
+    reviewer: (optional principal),
+    admin-notes: (string-ascii 500)
+  }
+)
+
+(define-map fraud-statistics
+  { farmer-id: uint }
+  {
+    total-reports: uint,
+    verified-reports: uint,
+    pending-reports: uint,
+    dismissed-reports: uint,
+    fraud-score: uint
+  }
+)
+
+(define-public (report-fraud 
+  (target-farmer-id uint) 
+  (target-subsidy-id uint) 
+  (report-type (string-ascii 50)) 
+  (description (string-ascii 500)) 
+  (evidence-hash (string-ascii 64)))
+  (let (
+    (report-id (var-get next-fraud-report-id))
+    (farmer-info (map-get? farmers { farmer-id: target-farmer-id }))
+    (subsidy-info (map-get? subsidies { subsidy-id: target-subsidy-id }))
+    (fraud-stats (default-to { total-reports: u0, verified-reports: u0, pending-reports: u0, dismissed-reports: u0, fraud-score: u0 }
+                              (map-get? fraud-statistics { farmer-id: target-farmer-id })))
+  )
+    (asserts! (is-some farmer-info) (err u404))
+    (asserts! (is-some subsidy-info) (err u404))
+    (asserts! (not (is-eq tx-sender (get principal (unwrap-panic farmer-info)))) (err u400))
+    (map-set fraud-reports
+      { report-id: report-id }
+      {
+        reporter: tx-sender,
+        target-farmer-id: target-farmer-id,
+        target-subsidy-id: target-subsidy-id,
+        report-type: report-type,
+        description: description,
+        evidence-hash: evidence-hash,
+        status: "pending",
+        reported-at: stacks-block-height,
+        reviewed-at: none,
+        reviewer: none,
+        admin-notes: ""
+      }
+    )
+    (map-set fraud-statistics
+      { farmer-id: target-farmer-id }
+      {
+        total-reports: (+ (get total-reports fraud-stats) u1),
+        verified-reports: (get verified-reports fraud-stats),
+        pending-reports: (+ (get pending-reports fraud-stats) u1),
+        dismissed-reports: (get dismissed-reports fraud-stats),
+        fraud-score: (get fraud-score fraud-stats)
+      }
+    )
+    (var-set next-fraud-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (review-fraud-report (report-id uint) (approve bool) (admin-notes (string-ascii 500)))
+  (let (
+    (report-info (map-get? fraud-reports { report-id: report-id }))
+    (fraud-stats (unwrap-panic (map-get? fraud-statistics { farmer-id: (get target-farmer-id (unwrap-panic report-info)) })))
+  )
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-some report-info) (err u404))
+    (asserts! (is-eq (get status (unwrap-panic report-info)) "pending") (err u400))
+    (if approve
+      (begin
+        (map-set fraud-reports
+          { report-id: report-id }
+          (merge (unwrap-panic report-info) { 
+            status: "verified", 
+            reviewed-at: (some stacks-block-height), 
+            reviewer: (some tx-sender), 
+            admin-notes: admin-notes 
+          })
+        )
+        (map-set fraud-statistics
+          { farmer-id: (get target-farmer-id (unwrap-panic report-info)) }
+          {
+            total-reports: (get total-reports fraud-stats),
+            verified-reports: (+ (get verified-reports fraud-stats) u1),
+            pending-reports: (- (get pending-reports fraud-stats) u1),
+            dismissed-reports: (get dismissed-reports fraud-stats),
+            fraud-score: (+ (get fraud-score fraud-stats) u10)
+          }
+        )
+      )
+      (begin
+        (map-set fraud-reports
+          { report-id: report-id }
+          (merge (unwrap-panic report-info) { 
+            status: "dismissed", 
+            reviewed-at: (some stacks-block-height), 
+            reviewer: (some tx-sender), 
+            admin-notes: admin-notes 
+          })
+        )
+        (map-set fraud-statistics
+          { farmer-id: (get target-farmer-id (unwrap-panic report-info)) }
+          {
+            total-reports: (get total-reports fraud-stats),
+            verified-reports: (get verified-reports fraud-stats),
+            pending-reports: (- (get pending-reports fraud-stats) u1),
+            dismissed-reports: (+ (get dismissed-reports fraud-stats) u1),
+            fraud-score: (get fraud-score fraud-stats)
+          }
+        )
+      )
+    )
+    (ok approve)
+  )
+)
+
+(define-read-only (get-fraud-report (report-id uint))
+  (map-get? fraud-reports { report-id: report-id })
+)
+
+(define-read-only (get-fraud-statistics (farmer-id uint))
+  (map-get? fraud-statistics { farmer-id: farmer-id })
+)
+
+(define-read-only (get-farmer-fraud-score (farmer-id uint))
+  (match (map-get? fraud-statistics { farmer-id: farmer-id })
+    stats (get fraud-score stats)
+    u0
+  )
+)
