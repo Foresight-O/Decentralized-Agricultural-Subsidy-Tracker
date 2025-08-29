@@ -605,3 +605,204 @@
     u0
   )
 )
+
+(define-data-var next-yield-report-id uint u1)
+(define-data-var current-season uint u1)
+
+(define-map yield-reports
+  { report-id: uint }
+  {
+    farmer-id: uint,
+    season: uint,
+    crop-type: (string-ascii 50),
+    area-planted: uint,
+    yield-amount: uint,
+    yield-per-unit: uint,
+    harvest-date: uint,
+    reported-by: principal,
+    verified: bool,
+    verifier: (optional principal),
+    verification-date: (optional uint),
+    quality-grade: (string-ascii 20)
+  }
+)
+
+(define-map seasonal-performance
+  { farmer-id: uint, season: uint }
+  {
+    total-yield: uint,
+    total-area: uint,
+    average-yield-per-unit: uint,
+    performance-score: uint,
+    reports-count: uint,
+    verified-reports: uint
+  }
+)
+
+(define-map farmer-yield-history
+  { farmer-id: uint }
+  {
+    total-seasons: uint,
+    best-season-yield: uint,
+    average-annual-yield: uint,
+    total-lifetime-yield: uint,
+    consistency-score: uint
+  }
+)
+
+(define-public (report-yield 
+  (farmer-id uint) 
+  (crop-type (string-ascii 50)) 
+  (area-planted uint) 
+  (yield-amount uint) 
+  (quality-grade (string-ascii 20)))
+  (let (
+    (report-id (var-get next-yield-report-id))
+    (farmer-info (map-get? farmers { farmer-id: farmer-id }))
+    (yield-per-unit (if (> area-planted u0) (/ yield-amount area-planted) u0))
+    (current-season-val (var-get current-season))
+    (existing-performance (default-to { total-yield: u0, total-area: u0, average-yield-per-unit: u0, performance-score: u0, reports-count: u0, verified-reports: u0 }
+                                      (map-get? seasonal-performance { farmer-id: farmer-id, season: current-season-val })))
+    (yield-history (default-to { total-seasons: u0, best-season-yield: u0, average-annual-yield: u0, total-lifetime-yield: u0, consistency-score: u0 }
+                               (map-get? farmer-yield-history { farmer-id: farmer-id })))
+  )
+    (asserts! (is-some farmer-info) (err u404))
+    (asserts! (is-eq tx-sender (get principal (unwrap-panic farmer-info))) (err u403))
+    (asserts! (get verified (unwrap-panic farmer-info)) (err u400))
+    (asserts! (> yield-amount u0) (err u400))
+    (asserts! (> area-planted u0) (err u400))
+    (map-set yield-reports
+      { report-id: report-id }
+      {
+        farmer-id: farmer-id,
+        season: current-season-val,
+        crop-type: crop-type,
+        area-planted: area-planted,
+        yield-amount: yield-amount,
+        yield-per-unit: yield-per-unit,
+        harvest-date: stacks-block-height,
+        reported-by: tx-sender,
+        verified: false,
+        verifier: none,
+        verification-date: none,
+        quality-grade: quality-grade
+      }
+    )
+    (map-set seasonal-performance
+      { farmer-id: farmer-id, season: current-season-val }
+      {
+        total-yield: (+ (get total-yield existing-performance) yield-amount),
+        total-area: (+ (get total-area existing-performance) area-planted),
+        average-yield-per-unit: (get average-yield-per-unit existing-performance),
+        performance-score: (get performance-score existing-performance),
+        reports-count: (+ (get reports-count existing-performance) u1),
+        verified-reports: (get verified-reports existing-performance)
+      }
+    )
+    (var-set next-yield-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (verify-yield-report (report-id uint))
+  (let (
+    (report-info (map-get? yield-reports { report-id: report-id }))
+    (verifier-info (map-get? verifiers { verifier-id: tx-sender }))
+    (seasonal-perf (unwrap-panic (map-get? seasonal-performance { farmer-id: (get farmer-id (unwrap-panic report-info)), season: (get season (unwrap-panic report-info)) })))
+    (yield-history (default-to { total-seasons: u0, best-season-yield: u0, average-annual-yield: u0, total-lifetime-yield: u0, consistency-score: u0 }
+                               (map-get? farmer-yield-history { farmer-id: (get farmer-id (unwrap-panic report-info)) })))
+  )
+    (asserts! (is-some verifier-info) (err u403))
+    (asserts! (get active (unwrap-panic verifier-info)) (err u403))
+    (asserts! (is-some report-info) (err u404))
+    (asserts! (not (get verified (unwrap-panic report-info))) (err u400))
+    (map-set yield-reports
+      { report-id: report-id }
+      (merge (unwrap-panic report-info) { 
+        verified: true, 
+        verifier: (some tx-sender), 
+        verification-date: (some stacks-block-height) 
+      })
+    )
+    (let (
+      (new-verified-count (+ (get verified-reports seasonal-perf) u1))
+      (new-total-area (get total-area seasonal-perf))
+      (new-total-yield (get total-yield seasonal-perf))
+      (new-avg-yield (if (> new-total-area u0) (/ new-total-yield new-total-area) u0))
+      (performance-score (if (> new-avg-yield u50) u100 (if (> new-avg-yield u25) u75 u50)))
+    )
+      (map-set seasonal-performance
+        { farmer-id: (get farmer-id (unwrap-panic report-info)), season: (get season (unwrap-panic report-info)) }
+        {
+          total-yield: new-total-yield,
+          total-area: new-total-area,
+          average-yield-per-unit: new-avg-yield,
+          performance-score: performance-score,
+          reports-count: (get reports-count seasonal-perf),
+          verified-reports: new-verified-count
+        }
+      )
+      (map-set farmer-yield-history
+        { farmer-id: (get farmer-id (unwrap-panic report-info)) }
+        {
+          total-seasons: (get total-seasons yield-history),
+          best-season-yield: (if (> new-total-yield (get best-season-yield yield-history)) new-total-yield (get best-season-yield yield-history)),
+          average-annual-yield: (get average-annual-yield yield-history),
+          total-lifetime-yield: (+ (get total-lifetime-yield yield-history) (get yield-amount (unwrap-panic report-info))),
+          consistency-score: (get consistency-score yield-history)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (advance-season)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (var-set current-season (+ (var-get current-season) u1))
+    (ok (var-get current-season))
+  )
+)
+
+(define-public (calculate-farmer-consistency (farmer-id uint))
+  (let (
+    (yield-history (map-get? farmer-yield-history { farmer-id: farmer-id }))
+  )
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-some yield-history) (err u404))
+    (let (
+      (total-seasons (get total-seasons (unwrap-panic yield-history)))
+      (consistency-score (if (>= total-seasons u3) u100 (* total-seasons u25)))
+    )
+      (map-set farmer-yield-history
+        { farmer-id: farmer-id }
+        (merge (unwrap-panic yield-history) { consistency-score: consistency-score })
+      )
+      (ok consistency-score)
+    )
+  )
+)
+
+(define-read-only (get-yield-report (report-id uint))
+  (map-get? yield-reports { report-id: report-id })
+)
+
+(define-read-only (get-seasonal-performance (farmer-id uint) (season uint))
+  (map-get? seasonal-performance { farmer-id: farmer-id, season: season })
+)
+
+(define-read-only (get-farmer-yield-history (farmer-id uint))
+  (map-get? farmer-yield-history { farmer-id: farmer-id })
+)
+
+(define-read-only (get-current-season)
+  (var-get current-season)
+)
+
+(define-read-only (get-farmer-performance-score (farmer-id uint))
+  (match (map-get? seasonal-performance { farmer-id: farmer-id, season: (var-get current-season) })
+    performance (get performance-score performance)
+    u0
+  )
+)
