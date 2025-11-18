@@ -806,3 +806,157 @@
     u0
   )
 )
+
+(define-data-var min-eligibility-score uint u50)
+(define-data-var bonus-multiplier-high uint u150)
+(define-data-var bonus-multiplier-medium uint u125)
+(define-data-var bonus-multiplier-low uint u100)
+
+(define-map eligibility-scores
+  { farmer-id: uint }
+  {
+    total-score: uint,
+    yield-score: uint,
+    fraud-penalty: uint,
+    approval-rate: uint,
+    tier: (string-ascii 20),
+    last-updated: uint
+  }
+)
+
+(define-map eligibility-tiers
+  { tier-name: (string-ascii 20) }
+  {
+    min-score: uint,
+    max-score: uint,
+    subsidy-multiplier: uint,
+    priority-level: uint
+  }
+)
+
+(define-public (setup-eligibility-tiers)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (map-set eligibility-tiers
+      { tier-name: "tier-1" }
+      {
+        min-score: u80,
+        max-score: u100,
+        subsidy-multiplier: u150,
+        priority-level: u3
+      }
+    )
+    (map-set eligibility-tiers
+      { tier-name: "tier-2" }
+      {
+        min-score: u50,
+        max-score: u79,
+        subsidy-multiplier: u125,
+        priority-level: u2
+      }
+    )
+    (map-set eligibility-tiers
+      { tier-name: "tier-3" }
+      {
+        min-score: u0,
+        max-score: u49,
+        subsidy-multiplier: u100,
+        priority-level: u1
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-eligibility-score (farmer-id uint))
+  (let (
+    (farmer-info (map-get? farmers { farmer-id: farmer-id }))
+    (yield-history (map-get? farmer-yield-history { farmer-id: farmer-id }))
+    (fraud-stats (map-get? fraud-statistics { farmer-id: farmer-id }))
+    (app-history (map-get? farmer-application-history { farmer-id: farmer-id }))
+    (yield-score (match yield-history hist (+ (get total-lifetime-yield hist) (get consistency-score hist)) u0))
+    (fraud-penalty (match fraud-stats stats (get fraud-score stats) u0))
+    (app-rate (if (is-some app-history)
+      (let (
+        (hist-data (unwrap-panic app-history))
+        (total-apps (get total-applications hist-data))
+      )
+        (if (> total-apps u0) (/ (* (get approved-applications hist-data) u100) total-apps) u0)
+      )
+      u0
+    ))
+    (base-score (+ (if (> yield-score u0) (/ yield-score u10) u0) app-rate))
+    (adjusted-score (if (> fraud-penalty u0) (- base-score fraud-penalty) base-score))
+    (final-score (if (> adjusted-score u100) u100 adjusted-score))
+    (tier (if (>= final-score u80)
+      "tier-1"
+      (if (>= final-score u50) "tier-2" "tier-3")
+    ))
+  )
+    (asserts! (is-some farmer-info) (err u404))
+    (map-set eligibility-scores
+      { farmer-id: farmer-id }
+      {
+        total-score: final-score,
+        yield-score: yield-score,
+        fraud-penalty: fraud-penalty,
+        approval-rate: app-rate,
+        tier: tier,
+        last-updated: stacks-block-height
+      }
+    )
+    (ok final-score)
+  )
+)
+
+(define-public (distribute-subsidy-with-incentive (farmer-id uint) (subsidy-id uint))
+  (let (
+    (farmer-info (map-get? farmers { farmer-id: farmer-id }))
+    (subsidy-info (map-get? subsidies { subsidy-id: subsidy-id }))
+    (eligibility-info (map-get? eligibility-scores { farmer-id: farmer-id }))
+  )
+    (asserts! (is-eq tx-sender (var-get admin)) (err u403))
+    (asserts! (is-some farmer-info) (err u404))
+    (asserts! (is-some subsidy-info) (err u404))
+    (asserts! (is-some eligibility-info) (err u400))
+    (asserts! (get verified (unwrap-panic farmer-info)) (err u400))
+    (asserts! (get active (unwrap-panic subsidy-info)) (err u400))
+    (asserts! (is-none (map-get? farmer-subsidies { farmer-id: farmer-id, subsidy-id: subsidy-id })) (err u400))
+    (asserts! (>= (get total-score (unwrap-panic eligibility-info)) (var-get min-eligibility-score)) (err u400))
+    (let (
+      (base-amount (get amount (unwrap-panic subsidy-info)))
+      (tier (get tier (unwrap-panic eligibility-info)))
+      (multiplier (match (map-get? eligibility-tiers { tier-name: tier })
+        tier-info (get subsidy-multiplier tier-info)
+        u100
+      ))
+      (bonus-amount (/ (* base-amount multiplier) u100))
+    )
+      (map-set farmer-subsidies
+        { farmer-id: farmer-id, subsidy-id: subsidy-id }
+        {
+          amount-received: bonus-amount,
+          date-received: stacks-block-height,
+          status: "distributed"
+        }
+      )
+      (var-set total-subsidies-distributed (+ (var-get total-subsidies-distributed) bonus-amount))
+      (ok bonus-amount)
+    )
+  )
+)
+
+(define-read-only (get-eligibility-score (farmer-id uint))
+  (map-get? eligibility-scores { farmer-id: farmer-id })
+)
+
+(define-read-only (get-eligibility-tier (tier-name (string-ascii 20)))
+  (map-get? eligibility-tiers { tier-name: tier-name })
+)
+
+(define-read-only (is-farmer-eligible (farmer-id uint))
+  (match (map-get? eligibility-scores { farmer-id: farmer-id })
+    score (>= (get total-score score) (var-get min-eligibility-score))
+    false
+  )
+)
